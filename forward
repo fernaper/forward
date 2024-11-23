@@ -1,0 +1,164 @@
+#!/bin/bash
+
+# Autocompletion function
+_forward_completions() {
+    local cur prev opts
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+    # Options list
+    local all_opts="-s -p -P -d"
+    local used_opts=("${COMP_WORDS[@]:1}")  # Remove script name
+    local remaining_opts=""
+
+    # Remove used options from the list of available options
+    for opt in ${all_opts}; do
+        if [[ ! " ${used_opts[@]} " =~ " ${opt} " ]]; then
+            remaining_opts+="$opt "
+        fi
+    done
+
+    # Provide suggestions for remaining options
+    if [[ ${cur} == -* ]]; then
+        COMPREPLY=( $(compgen -W "${remaining_opts}" -- ${cur}) )
+        return 0
+    fi
+
+    # Handle specific option autocompletions
+    case "$prev" in
+        -s)
+            # Fetch SSH hosts from ~/.ssh/config and ~/.ssh/known_hosts
+            local ssh_hosts=$(awk '/^Host / {for (i=2; i<=NF; i++) print $i}' ~/.ssh/config 2>/dev/null)
+            COMPREPLY=( $(compgen -W "${ssh_hosts}" -- ${cur}) )
+            ;;
+        -d)
+            # Fetch Docker containers
+            local containers
+            if [[ " ${used_opts[@]} " =~ " -s " ]]; then
+                # If -s is specified, use remote server
+                local remote_server="${COMP_WORDS[$((${COMP_CWORD}-2))]}"
+                containers=$(ssh "$remote_server" "docker ps --format '{{.Names}}'" 2>/dev/null)
+            else
+                # Use local Docker containers
+                containers=$(docker ps --format '{{.Names}}')
+            fi
+            COMPREPLY=( $(compgen -W "${containers}" -- ${cur}) )
+            ;;
+    esac
+    return 0
+}
+
+# Forward command functionality
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+    # If sourced, register autocompletion
+    complete -F _forward_completions forward
+    return
+fi
+
+# Initialize variables with default values
+REMOTE_SERVER="localhost"
+LOCAL_PORT=""
+EXTERNAL_PORT=""
+EXPOSE_PUBLICLY=false
+CONTAINER_NAME=""
+
+# Parse options
+while getopts "s:p:Pd:" opt; do
+    case $opt in
+        s)
+            REMOTE_SERVER="$OPTARG"
+            ;;
+        p)
+            PORTS="$OPTARG"
+            LOCAL_PORT=$(echo "$PORTS" | cut -d':' -f1)
+            EXTERNAL_PORT=$(echo "$PORTS" | cut -d':' -f2)
+            ;;
+        P)
+            EXPOSE_PUBLICLY=true
+            ;;
+        d)
+            CONTAINER_NAME="$OPTARG"
+            ;;
+        *)
+            echo "Usage: forward [-s user@remote_server] -p local_port:external_port [-P] [-d container_name]"
+            exit 1
+            ;;
+    esac
+done
+
+# Validate required options
+if [ -z "${LOCAL_PORT}" ] || [ -z "${EXTERNAL_PORT}" ] && [ -z "${CONTAINER_NAME}" ]; then
+    echo "Usage: forward [-s user@remote_server] -p local_port:external_port [-P] [-d container_name]"
+    exit 1
+fi
+
+# Handle Docker container redirection if -d is specified
+if [ -n "${CONTAINER_NAME}" ]; then
+    echo "Fetching IP of Docker container '${CONTAINER_NAME}' on ${REMOTE_SERVER}..."
+    if [ "${REMOTE_SERVER}" == "localhost" ]; then
+        CONTAINER_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CONTAINER_NAME" 2>/dev/null)
+    else
+        CONTAINER_IP=$(ssh "$REMOTE_SERVER" "docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' '$CONTAINER_NAME'" 2>/dev/null)
+    fi
+
+    if [ -z "${CONTAINER_IP}" ]; then
+        echo "Error: Could not obtain the IP address of container '${CONTAINER_NAME}'. Verify that it is running."
+        exit 1
+    fi
+
+    # Use container IP for redirection
+    EXTERNAL_PORT=${EXTERNAL_PORT:-27017}  # Default port if not specified
+    LOCAL_PORT=${LOCAL_PORT:-27017}        # Default local port if not specified
+    echo "Redirecting ports from Docker conainer in ${REMOTE_SERVER} ${CONTAINER_IP}:${EXTERNAL_PORT} -> http://localhost:${LOCAL_PORT}"
+
+    if [ "${REMOTE_SERVER}" == "localhost" ]; then
+        # Use socat for local redirection
+        echo "Using socat for local port redirection."
+        socat TCP-LISTEN:${LOCAL_PORT},fork,reuseaddr TCP:${CONTAINER_IP}:${EXTERNAL_PORT} &
+        SOCAT_PID=$!
+        echo "Socat started with PID ${SOCAT_PID}. Press Ctrl+C to terminate."
+        trap "kill ${SOCAT_PID}" EXIT
+        wait
+    else
+        # Use SSH for remote redirection
+        ssh -N -L "${LOCAL_PORT}:${CONTAINER_IP}:${EXTERNAL_PORT}" "${REMOTE_SERVER}"
+    fi
+    exit 0
+fi
+
+# Skip SSH tunnel if REMOTE_SERVER is localhost but handle port redirection if needed
+if [ "${REMOTE_SERVER}" == "localhost" ]; then
+    if [ "${LOCAL_PORT}" != "${EXTERNAL_PORT}" ]; then
+        echo "Redirecting ports: http://localhost${EXTERNAL_PORT} -> http://localhost:${LOCAL_PORT}"
+        # Perform port redirection using socat
+        socat TCP-LISTEN:${LOCAL_PORT},fork TCP:localhost:${EXTERNAL_PORT} &
+        FORWARD_PID=$!
+    else
+        echo "No port redirection needed for identical ports on localhost."
+        FORWARD_PID=""
+    fi
+else
+    echo "Redirecting ports from ${REMOTE_SERVER}:${EXTERNAL_PORT} -> http://localhost:${LOCAL_PORT}"
+    # Create SSH tunnel in a non-blocking mode (-N) and run in the background
+    ssh -N -L "${LOCAL_PORT}:localhost:${EXTERNAL_PORT}" "${REMOTE_SERVER}" &
+    FORWARD_PID=$!
+fi
+
+# If -P is used, create the localhost.run tunnel and run in background
+if [ "${EXPOSE_PUBLICLY}" = true ]; then
+    echo "Exposing port ${LOCAL_PORT} publicly via localhost.run..."
+    ssh -R 80:localhost:"${LOCAL_PORT}" localhost.run &
+    PUBLIC_PID=$!
+fi
+
+# Trap SIGINT (Ctrl+C) to allow clean termination of both tunnels
+trap "echo 'Closing SSH tunnels...'; [ -n \"${FORWARD_PID}\" ] && kill $FORWARD_PID; [ -n \"${PUBLIC_PID}\" ] && kill $PUBLIC_PID; exit" INT
+
+# Display status message
+echo "SSH tunnel established: http://localhost:${LOCAL_PORT} -> ${REMOTE_SERVER}:${EXTERNAL_PORT}"
+[ "${EXPOSE_PUBLICLY}" = true ] && echo "Public exposure active via localhost.run."
+
+# Keep the script running to maintain the tunnels
+[ -n "${FORWARD_PID}" ] && wait $FORWARD_PID
+
